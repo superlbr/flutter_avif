@@ -1,11 +1,10 @@
 name: build-android-so
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
+  # 只在手动触发或打 v* tag 时构建；push / PR 不再自动跑
   workflow_dispatch:
+  push:
+    tags: ['v*']
 
 env:
   CARGO_NDK_VERSION: 4.1.2
