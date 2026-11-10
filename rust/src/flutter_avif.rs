@@ -7,11 +7,130 @@ use std::mem;
 use std::os::raw::c_uchar;
 use std::slice;
 use std::sync::RwLock;
+use std::time::Instant;
 
 use crate::models::avif_info::AvifInfo;
 use crate::models::encode_request::EncodeRequest;
 use crate::models::frame::Frame;
 use crate::models::key_request::KeyRequest;
+
+/// 分段计时开关：进程环境变量 `FLUTTER_AVIF_TRACE` 存在即开启，默认完全关闭。
+///
+/// Android 上给 app 注入环境变量：
+/// ```text
+/// adb shell setprop wrap.<applicationId> "env FLUTTER_AVIF_TRACE=1"
+/// ```
+/// （需要 debuggable 包；改完要 `adb shell setprop wrap.<applicationId> ""` 复位）
+/// 宿主调试直接 `FLUTTER_AVIF_TRACE=1 ./your_binary`。
+///
+/// 输出固定一行，单位微秒，字段顺序固定，便于脚本解析：
+/// ```text
+/// [avif-trace] frame 896x1200 t1=412 t2=7898 t3=595 t4=3510 t5=-1 total=12415
+/// ```
+/// t1 = create+Parse（header）、t2 = NextImage（dav1d 出 YUV）、t3 = YUVToRGB、
+/// t4 = write_to_bytes 组包完成，四个值都是**相对上一段的耗时**；`total` = t0→t4。
+/// `t5` 恒为 -1：postCObject 发生在 `allo_isolate::Isolate::task` 内部，从这里量不到，
+/// 需要 Dart 侧用「回调到达时间 − t4」补（见 README/交付说明）。
+fn trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLUTTER_AVIF_TRACE").is_some())
+}
+
+struct Trace {
+    on: bool,
+    t0: Instant,
+    t1: Option<Instant>,
+    t2: Option<Instant>,
+    t3: Option<Instant>,
+    t4: Option<Instant>,
+}
+
+impl Trace {
+    #[inline]
+    fn new() -> Self {
+        Trace {
+            on: trace_enabled(),
+            t0: Instant::now(),
+            t1: None,
+            t2: None,
+            t3: None,
+            t4: None,
+        }
+    }
+
+    #[inline]
+    fn mark1(&mut self) {
+        if self.on {
+            self.t1 = Some(Instant::now());
+        }
+    }
+
+    #[inline]
+    fn mark2(&mut self) {
+        if self.on {
+            self.t2 = Some(Instant::now());
+        }
+    }
+
+    #[inline]
+    fn mark3(&mut self) {
+        if self.on {
+            self.t3 = Some(Instant::now());
+        }
+    }
+
+    #[inline]
+    fn mark4(&mut self) {
+        if self.on {
+            self.t4 = Some(Instant::now());
+        }
+    }
+
+    fn emit(&self, width: u32, height: u32) {
+        if !self.on {
+            return;
+        }
+
+        let us = |a: Instant, b: Instant| b.saturating_duration_since(a).as_micros();
+        let t1 = self.t1.unwrap_or(self.t0);
+        let t2 = self.t2.unwrap_or(t1);
+        let t3 = self.t3.unwrap_or(t2);
+        let t4 = self.t4.unwrap_or(t3);
+
+        let line = format!(
+            "[avif-trace] frame {}x{} t1={} t2={} t3={} t4={} t5=-1 total={}",
+            width,
+            height,
+            us(self.t0, t1),
+            us(t1, t2),
+            us(t2, t3),
+            us(t3, t4),
+            us(self.t0, t4),
+        );
+        log_line(&line);
+    }
+}
+
+#[cfg(target_os = "android")]
+fn log_line(msg: &str) {
+    extern "C" {
+        fn __android_log_print(prio: i32, tag: *const c_uchar, fmt: *const c_uchar, ...) -> i32;
+    }
+    // ANDROID_LOG_INFO = 4
+    static TAG: &[u8] = b"avif-trace\0";
+    static FMT: &[u8] = b"%s\0";
+    let mut buf = Vec::with_capacity(msg.len() + 1);
+    buf.extend_from_slice(msg.as_bytes());
+    buf.push(0);
+    unsafe {
+        __android_log_print(4, TAG.as_ptr(), FMT.as_ptr(), buf.as_ptr());
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn log_line(msg: &str) {
+    println!("{}", msg);
+}
 
 /// 改动 4：dav1d 的解码线程数，**默认关闭的可选开关**。
 ///
@@ -39,11 +158,17 @@ pub extern "C" fn decode_single_frame_image(port: i64, ptr: *const c_uchar, len:
     let isolate = Isolate::new(port);
 
     task::spawn(isolate.task(async move {
-        let decoder = _init_memory_decoder(input.data.as_ptr(), input.data.len());
-        let image = _get_next_frame(decoder);
+        let mut trace = Trace::new();
+        let decoder = _init_memory_decoder(input.data.as_ptr(), input.data.len(), &mut trace);
+        let image = _get_next_frame(decoder, &mut trace);
         _dispose_decoder(decoder);
 
-        return image.write_to_bytes().unwrap();
+        let (width, height) = (image.width, image.height);
+        let bytes = image.write_to_bytes().unwrap();
+        trace.mark4();
+        trace.emit(width, height);
+
+        return bytes;
     }));
 
     return port;
@@ -71,7 +196,9 @@ pub extern "C" fn init_memory_decoder(port: i64, ptr: *const c_uchar, len: usize
     task::spawn(isolate.task(async move {
         unsafe {
             let mut avif_bytes = input.data;
-            let decoder = _init_memory_decoder(avif_bytes.as_ptr(), avif_bytes.len());
+            let mut trace = Trace::new();
+            let decoder =
+                _init_memory_decoder(avif_bytes.as_ptr(), avif_bytes.len(), &mut trace);
 
             let mut avif_info = AvifInfo::new();
             avif_info.width = 0;
@@ -161,9 +288,15 @@ pub extern "C" fn get_next_frame(port: i64, ptr: *const c_uchar, len: usize) -> 
             }
 
             let decoder = &map[&input.key];
-            let result = _get_next_frame(decoder.decoder);
+            let mut trace = Trace::new();
+            let result = _get_next_frame(decoder.decoder, &mut trace);
 
-            return result.write_to_bytes().unwrap();
+            let (width, height) = (result.width, result.height);
+            let bytes = result.write_to_bytes().unwrap();
+            trace.mark4();
+            trace.emit(width, height);
+
+            return bytes;
         }
     }));
 
@@ -265,7 +398,7 @@ pub extern "C" fn encode_avif(port: i64, ptr: *const c_uchar, len: usize) -> i64
     return port;
 }
 
-fn _init_memory_decoder(ptr: *const u8, len: usize) -> *mut avifDecoder {
+fn _init_memory_decoder(ptr: *const u8, len: usize, trace: &mut Trace) -> *mut avifDecoder {
     unsafe {
         let decoder = libavif_sys::avifDecoderCreate();
         // 改动 4（可选）：必须在 Parse 之前设置，libavif 会按此创建 dav1d 线程池
@@ -287,6 +420,8 @@ fn _init_memory_decoder(ptr: *const u8, len: usize) -> *mut avifDecoder {
             libavif_sys::avifDecoderDestroy(decoder);
             panic!("Couldn't decode the image. Code: {}", parse_result);
         }
+
+        trace.mark1();
 
         return decoder;
     }
@@ -323,7 +458,7 @@ fn _reset_decoder(decoder: *mut libavif_sys::avifDecoder) -> Frame {
 // rgb 的若干个字段是写给 C 侧读的（经 raw_rgb 指针），rustc 看不到这次读取，
 // 会报 `unused_assignments`，属于误报。
 #[allow(unused_assignments)]
-fn _get_next_frame(decoder: *mut libavif_sys::avifDecoder) -> Frame {
+fn _get_next_frame(decoder: *mut libavif_sys::avifDecoder, trace: &mut Trace) -> Frame {
     unsafe {
         let mut decode_result = libavif_sys::avifDecoderNextImage(decoder);
         if decode_result == libavif_sys::AVIF_RESULT_NO_IMAGES_REMAINING {
@@ -334,6 +469,7 @@ fn _get_next_frame(decoder: *mut libavif_sys::avifDecoder) -> Frame {
         if decode_result != libavif_sys::AVIF_RESULT_OK {
             panic!("decode error {}", decode_result);
         }
+        trace.mark2();
 
         let image = (*decoder).image;
         let width = (*image).width;
@@ -365,6 +501,7 @@ fn _get_next_frame(decoder: *mut libavif_sys::avifDecoder) -> Frame {
         if conversion_result != libavif_sys::AVIF_RESULT_OK {
             panic!("yuv_to_rgb error {}", conversion_result);
         }
+        trace.mark3();
         // avifRGBImageFreePixels 不需要调用：像素内存归上面的 Vec 所有。
 
         let mut frame = Frame::new();

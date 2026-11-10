@@ -33,4 +33,8 @@ fn main() {
     println!("cargo:rustc-link-arg=-Wl,--end-group");
     // libavif 用到 libm，Android 上不会自动带上
     println!("cargo:rustc-link-arg=-lm");
+    // 分段计时用 __android_log_print，它属于 liblog，不显式链接会留成 UND 符号
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        println!("cargo:rustc-link-arg=-llog");
+    }
 }
