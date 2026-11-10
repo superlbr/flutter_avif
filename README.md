@@ -133,34 +133,6 @@ Output is written to `dist/<abi>/libflutter_avif.so` and mirrored into
 `build.sh` finishes with an `llvm-nm -D -u` check and fails the build if any `dav1d_*` / `avif*`
 symbol is left undefined.
 
-## Diagnostics
-
-Per-stage timing is compiled in and off by default. Any one of these enables it:
-
-- build-time `--features trace-always`: unconditional logging, for devices where the two
-  channels below are not writable;
-- the `FLUTTER_AVIF_TRACE` environment variable, any value;
-- on Android, the system property `debug.flutter_avif.trace=1` (also accepts `true`):
-
-```bash
-adb shell setprop debug.flutter_avif.trace 1
-adb shell getprop debug.flutter_avif.trace    # should print 1
-```
-
-The flag is resolved **once per process**, at the first decode, and cached — the property is not
-read per frame. Changing or clearing it afterwards has no effect until the app is restarted.
-
-Every decoded frame then logs one fixed-format line under the logcat tag `avif-trace`:
-
-```
-[avif-trace] frame 896x1200 t1=412 t2=7898 t3=595 t4=3510 t5=-1 total=12415
-```
-
-Values are microseconds and `t1`…`t4` are contiguous deltas — decoder creation + `Parse`,
-`avifDecoderNextImage`, `avifImageYUVToRGB`, protobuf packing — with `total` their sum. `t5` is
-always `-1`: `postCObject` happens inside the `allo_isolate` task wrapper, so its return is not
-observable from Rust; derive it on the Dart side as *(message arrival − total)*.
-
 ## CI and artifacts
 
 Workflow: **`build-android-so`** ([build-android.yml](.github/workflows/build-android.yml)).
