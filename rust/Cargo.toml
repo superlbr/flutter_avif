@@ -1,0 +1,45 @@
+[package]
+name = "flutter_avif"
+version = "0.1.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+
+[lib]
+# Android 只需要 cdylib（产物即 libflutter_avif.so）
+crate-type = ["cdylib"]
+
+[features]
+default = []
+# 改动 4 的可选开关：给 decoder 设 4 个 dav1d 线程。
+# 单 tile（当前线上形态）实测无收益，多 tile 才有 3.1~3.5x，所以默认不开。
+max-threads = []
+
+[dependencies]
+libavif-sys = { version = "0.17", default-features = false, features = ["codec-dav1d"] }
+libdav1d-sys = "0.7.1"
+lazy_static = "1.4.0"
+cmake = "=0.1.48"
+proc-macro2 = "=1.0.79"
+# 必须精确锁定：models/*.rs 由 protobuf-codegen 3.7.1 生成，
+# 内部硬引用 ::protobuf::VERSION_3_7_1
+protobuf = "=3.7.1"
+allo-isolate = "0.1.26"
+async-std = "1.13.0"
+
+# 注意：这里**不能**再放一份到 [build-dependencies]。DEP_AVIF_STATICLIB /
+# DEP_DAV1D_STATICLIB 是普通依赖（带 links）的 build script 提供的，放在
+# build-dependencies 里会让 libavif/dav1d 为主机再编一遍（而且会被 Android 的
+# CMAKE_TOOLCHAIN_FILE/ANDROID_ABI 带偏，直接编译失败）。
+
+# 依赖全部落在本仓库 vendors/ 下，git clone 后一条命令即可构建，不需要任何 fork 仓库
+[patch.crates-io]
+libavif-sys = { path = "../vendors/libavif-sys" }
+libdav1d-sys = { path = "../vendors/libdav1d-sys" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "unwind"          # 不要改 abort：上游 unwrap() 很多，abort 会把异步任务 panic 升级成进程崩溃
+strip = "debuginfo"       # 符号表交给 build.sh 的 llvm-strip 处理

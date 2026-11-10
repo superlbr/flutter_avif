@@ -1,0 +1,47 @@
+name: flutter_avif
+description: A flutter plugin to view and encode avif images using libavif.
+version: 3.1.0
+repository: https://github.com/yekeskin/flutter_avif
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # 同仓库（monorepo）内部一律走 path，避免依赖 pub.dev 上未打补丁的版本。
+  flutter_avif_platform_interface:
+    path: ../flutter_avif_platform_interface
+  flutter_avif_android:
+    path: ../flutter_avif_android
+  flutter_avif_ios:
+    path: ../flutter_avif_ios
+  flutter_avif_macos: ^3.1.0
+  flutter_avif_linux: ^3.1.0
+  flutter_avif_windows: ^3.1.0
+  flutter_avif_web: ^3.1.0
+  http: ^1.2.2
+  exif: ^3.3.0
+  flutter_cache_manager: ^3.4.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  
+flutter:
+  plugin:
+    platforms:
+      android:
+        default_package: flutter_avif_android
+      ios:
+        default_package: flutter_avif_ios
+      macos:
+        default_package: flutter_avif_macos
+      linux:
+        default_package: flutter_avif_linux
+      windows:
+        default_package: flutter_avif_windows
+      web:
+        default_package: flutter_avif_web

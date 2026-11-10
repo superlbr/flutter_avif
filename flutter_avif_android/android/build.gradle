@@ -1,0 +1,45 @@
+group 'com.teknorota.flutter_avif'
+version '1.0'
+
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.1.2'
+    }
+}
+
+rootProject.allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: 'com.android.library'
+
+android {
+
+    if (project.android.hasProperty("namespace")) {
+        namespace = "com.teknorota.flutter_avif"
+    }
+
+    // 补丁 3：上游 compileSdk 为 31，但其 androidx 依赖（fragment 1.7.1 等）
+    // 要求 depend-on 方也按 ≥34 编译，否则 checkAarMetadata 直接失败。
+    compileSdkVersion 36
+
+    // 补丁 2：上游 Java 目标 11，而工程 Kotlin 目标 17，Gradle 会以
+    // "Inconsistent JVM-target compatibility" 拒绝构建；这里统一到 17。
+    // （补丁 1 已删掉重名的 Kotlin 源码，本模块只剩 Java，故不再需要 kotlinOptions。）
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    defaultConfig {
+        minSdkVersion 16
+    }
+}

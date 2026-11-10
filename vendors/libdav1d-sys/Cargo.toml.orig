@@ -1,0 +1,23 @@
+[package]
+name = "libdav1d-sys"
+version = "0.7.1+libdav1d.1.4.3"
+authors = ["Charles Samuels <ks@ks.ax>", "Paolo Barbolini <paolo@paolo565.org>", "Kornel <kornel@geekhood.net>"]
+edition = "2021"
+build = "build.rs"
+links = "dav1d"
+description="Builds and statically links dav1d AV1 decoder. Part of libavif-sys"
+keywords=["ffi", "codec", "dav1d", "david", "AV1"]
+repository="https://github.com/njaard/libavif-rs"
+documentation="https://docs.rs/libavif-sys"
+license="BSD-2-Clause"
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+bindgen = { version="0.69.4", default-features = false, features = ["runtime"], optional = true }
+
+[features]
+# Generate FFI bindings using bindgen instead of using pregenerated ones.
+# This is recommended when using system library that may have a different version than the vendored dependency.
+generate = ["dep:bindgen"]
