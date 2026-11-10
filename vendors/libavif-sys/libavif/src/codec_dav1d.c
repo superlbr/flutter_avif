@@ -48,6 +48,12 @@ static void dav1dCodecDestroyInternal(avifCodec * codec)
     avifFree(codec->internal);
 }
 
+// 本地 vendor 新增（仅诊断，不是上游代码）：分段计时钩子。
+// 默认 NULL，每帧只有 3 次指针判空，行为与上游完全一致。
+// 由 Rust 侧在打开 trace 时挂上，stage: 1 = dav1d_open 完成、2 = send_data 返回、
+// 3 = get_picture 拿到画面。
+void (*avif_diag_dav1d_stage)(int stage) = NULL;
+
 static avifBool dav1dCodecGetNextImage(struct avifCodec * codec,
                                        struct avifDecoder * decoder,
                                        const avifDecodeSample * sample,
@@ -77,6 +83,9 @@ static avifBool dav1dCodecGetNextImage(struct avifCodec * codec,
         if (dav1d_open(&codec->internal->dav1dContext, &dav1dSettings) != 0) {
             return AVIF_FALSE;
         }
+        if (avif_diag_dav1d_stage) {
+            avif_diag_dav1d_stage(1);
+        }
     }
 
     avifBool gotPicture = AVIF_FALSE;
@@ -94,6 +103,9 @@ static avifBool dav1dCodecGetNextImage(struct avifCodec * codec,
             if ((res < 0) && (res != DAV1D_ERR(EAGAIN))) {
                 dav1d_data_unref(&dav1dData);
                 return AVIF_FALSE;
+            }
+            if (avif_diag_dav1d_stage) {
+                avif_diag_dav1d_stage(2);
             }
         }
 
@@ -117,6 +129,9 @@ static avifBool dav1dCodecGetNextImage(struct avifCodec * codec,
                 dav1d_picture_unref(&nextFrame);
             } else {
                 gotPicture = AVIF_TRUE;
+                if (avif_diag_dav1d_stage) {
+                    avif_diag_dav1d_stage(3);
+                }
                 break;
             }
         }
