@@ -153,29 +153,13 @@ read per frame. Changing or clearing it afterwards has no effect until the app i
 Every decoded frame then logs one fixed-format line under the logcat tag `avif-trace`:
 
 ```
-[avif-trace] frame 896x1200 t1=412 t2=7898 t3=595 t4=3510 t5=-1 total=12415 cpu2=7810 t2a=980 t2b=60 t2c=6310 cpu=6 freq=1804000 cpuflags=0xf thr=1 asm=1
+[avif-trace] frame 896x1200 t1=412 t2=7898 t3=595 t4=3510 t5=-1 total=12415
 ```
 
-All values are microseconds. `t1`…`t4` are contiguous deltas — decoder creation + `Parse`,
-`avifDecoderNextImage`, `avifImageYUVToRGB`, protobuf packing — with `total` their sum.
-
-- `cpu2` — thread CPU time consumed inside `t2` (`CLOCK_THREAD_CPUTIME_ID`). `cpu2 ≈ t2` means the
-  time is spent computing; `cpu2 ≪ t2` means the thread was descheduled or migrated.
-- `t2a` / `t2b` / `t2c` — `t2` split into `dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`.
-  `-1` means that stage did not fire because the decoder was reused.
-- `cpu` / `freq` — core running the decode thread and its current frequency in kHz (`-1` / `0`
-  when the ROM does not expose it).
-- `cpuflags` — `dav1d_get_cpu_flags()`; non-zero means SIMD paths are enabled.
-- `thr` / `asm` — decoder thread count and whether SIMD is active for this process.
-- `t5` is always `-1`: `postCObject` happens inside the `allo_isolate` task wrapper, so its return
-  is not observable from Rust; derive it on the Dart side as *(message arrival − total)*.
-
-Two more switches help with A/B comparisons (both off by default, both resolved once per process):
-
-```bash
-adb shell setprop debug.flutter_avif.noasm 1     # force dav1d C paths (dav1d_set_cpu_flags_mask(0))
-adb shell setprop debug.flutter_avif.threads 4   # decoder thread count; env: FLUTTER_AVIF_MAX_THREADS
-```
+Values are microseconds and `t1`…`t4` are contiguous deltas — decoder creation + `Parse`,
+`avifDecoderNextImage`, `avifImageYUVToRGB`, protobuf packing — with `total` their sum. `t5` is
+always `-1`: `postCObject` happens inside the `allo_isolate` task wrapper, so its return is not
+observable from Rust; derive it on the Dart side as *(message arrival − total)*.
 
 ## CI and artifacts
 

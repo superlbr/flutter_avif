@@ -37,20 +37,27 @@ use crate::models::key_request::KeyRequest;
 fn trace_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(feature = "trace-always")
-            || std::env::var_os("FLUTTER_AVIF_TRACE").is_some()
-            || property_is(b"debug.flutter_avif.trace\0", "1")
+        if cfg!(feature = "trace-always") {
+            return true;
+        }
+        if std::env::var_os("FLUTTER_AVIF_TRACE").is_some() {
+            return true;
+        }
+        #[cfg(target_os = "android")]
+        {
+            return property_is(b"debug.flutter_avif.trace\0", b"1");
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            false
+        }
     })
 }
 
 /// 读 Android 系统属性，与 `expected` 相等（大小写不敏感）即为真。
 /// `__system_property_get` 返回值的字节数，未设置时返回 0——空值一律当关闭。
-fn property_is(name: &[u8], expected: &str) -> bool {
-    property_string(name).map_or(false, |v| v.eq_ignore_ascii_case(expected))
-}
-
 #[cfg(target_os = "android")]
-fn property_string(name: &[u8]) -> Option<String> {
+fn property_is(name: &[u8], expected: &[u8]) -> bool {
     extern "C" {
         fn __system_property_get(name: *const c_uchar, value: *mut c_uchar) -> i32;
     }
@@ -58,200 +65,30 @@ fn property_string(name: &[u8]) -> Option<String> {
     let mut buf = [0u8; 92];
     let len = unsafe { __system_property_get(name.as_ptr(), buf.as_mut_ptr()) };
     if len <= 0 || len as usize >= buf.len() {
-        return None;
+        return false;
     }
-    Some(String::from_utf8_lossy(&buf[..len as usize]).into_owned())
-}
-
-#[cfg(not(target_os = "android"))]
-fn property_string(_name: &[u8]) -> Option<String> {
-    None
-}
-
-/// E5 对照开关：`FLUTTER_AVIF_NO_ASM=1` 或 `debug.flutter_avif.noasm=1`
-/// 让 dav1d 走纯 C 路径（`dav1d_set_cpu_flags_mask(0)`），用来验证 NEON 是否真的命中。
-/// 只做对照用，默认关闭；打开后解码会慢 3~4 倍，这不是性能选项。
-fn noasm_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("FLUTTER_AVIF_NO_ASM").is_some()
-            || property_is(b"debug.flutter_avif.noasm\0", "1")
-    })
-}
-
-/// E2 线程扫描：`FLUTTER_AVIF_MAX_THREADS=1|2|4` 或 `debug.flutter_avif.threads=1|2|4`。
-/// 未指定时回落到编译期默认（`--features max-threads` 为 4，否则 1 = 上游行为）。
-fn max_threads_runtime() -> i32 {
-    static N: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        let raw = std::env::var("FLUTTER_AVIF_MAX_THREADS")
-            .ok()
-            .or_else(|| property_string(b"debug.flutter_avif.threads\0"));
-        match raw.and_then(|v| v.trim().parse::<i32>().ok()) {
-            Some(n) if n > 0 => n,
-            _ => DECODE_MAX_THREADS,
-        }
-    })
-}
-
-#[repr(C)]
-struct Timespec {
-    tv_sec: i64,
-    tv_nsec: i64,
-}
-
-/// E1：当前线程累计 CPU 时间（微秒）。和 wall clock 对比可以区分「算得慢」和「被调度」。
-fn thread_cpu_us() -> u64 {
-    extern "C" {
-        fn clock_gettime(clk_id: i32, tp: *mut std::ffi::c_void) -> i32;
-    }
-    const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
-    // 32 位 Android 上 time_t 仍是 32 位，结构体布局不同
-    #[repr(C)]
-    struct Ts32 {
-        tv_sec: i32,
-        tv_nsec: i32,
-    }
-    if cfg!(target_pointer_width = "64") {
-        let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-        let r = unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts as *mut _ as *mut _) };
-        if r != 0 {
-            return 0;
-        }
-        (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1_000
-    } else {
-        let mut ts = Ts32 { tv_sec: 0, tv_nsec: 0 };
-        let r = unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts as *mut _ as *mut _) };
-        if r != 0 {
-            return 0;
-        }
-        (ts.tv_sec as u32 as u64) * 1_000_000 + (ts.tv_nsec as u32 as u64) / 1_000
-    }
-}
-
-/// E4：解码线程当前跑在哪个核上（`/proc/self/task/<tid>/stat` 第 39 字段）。
-fn current_core() -> i32 {
-    extern "C" {
-        fn gettid() -> i32;
-    }
-    let tid = unsafe { gettid() };
-    let stat = match std::fs::read_to_string(format!("/proc/self/task/{}/stat", tid)) {
-        Ok(s) => s,
-        Err(_) => return -1,
-    };
-    // comm 里可能有空格/括号，按最后一个 ')' 切；其后第一项是 state（字段 3）
-    let rest = match stat.rsplit_once(')') {
-        Some((_, r)) => r,
-        None => return -1,
-    };
-    // processor = 字段 39 => 索引 36
-    rest.split_whitespace()
-        .nth(36)
-        .and_then(|v| v.parse::<i32>().ok())
-        .unwrap_or(-1)
-}
-
-/// E4：该核当前频率（kHz）。部分 ROM 不允许 app 读，读不到返回 0。
-fn core_freq_khz(core: i32) -> u32 {
-    if core < 0 {
-        return 0;
-    }
-    std::fs::read_to_string(format!(
-        "/sys/devices/system/cpu/cpu{}/cpufreq/scaling_cur_freq",
-        core
-    ))
-    .ok()
-    .and_then(|s| s.trim().parse::<u32>().ok())
-    .unwrap_or(0)
-}
-
-extern "C" {
-    // libavif 的 codec_dav1d.c 里 vendor 时加的空转钩子（默认 NULL）
-    static mut avif_diag_dav1d_stage: Option<extern "C" fn(i32)>;
-    fn dav1d_set_cpu_flags_mask(mask: u32);
-}
-
-/// E5：dav1d 运行期实际启用的 SIMD 集合。
-/// `dav1d_get_cpu_flags()` 在 dav1d 里是宏，arm 上展开成 `dav1d_get_cpu_flags_arm`。
-#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
-fn dav1d_cpu_flags() -> u32 {
-    extern "C" {
-        fn dav1d_get_cpu_flags_arm() -> u32;
-    }
-    unsafe { dav1d_get_cpu_flags_arm() }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn dav1d_cpu_flags() -> u32 {
-    extern "C" {
-        fn dav1d_get_cpu_flags_x86() -> u32;
-    }
-    unsafe { dav1d_get_cpu_flags_x86() }
-}
-
-thread_local! {
-    // 钩子回调与解码在同一线程，用 thread-local 收集阶段时间戳，避免并发解码互相污染
-    static STAGES: std::cell::Cell<[Option<Instant>; 4]> = std::cell::Cell::new([None; 4]);
-}
-
-extern "C" fn on_dav1d_stage(stage: i32) {
-    if !(1..=3).contains(&stage) {
-        return;
-    }
-    STAGES.with(|c| {
-        let mut marks = c.get();
-        marks[stage as usize] = Some(Instant::now());
-        c.set(marks);
-    });
-}
-
-fn install_stage_hook() {
-    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    INSTALLED.get_or_init(|| unsafe {
-        avif_diag_dav1d_stage = Some(on_dav1d_stage);
-    });
+    buf[..len as usize].eq_ignore_ascii_case(expected)
 }
 
 struct Trace {
     on: bool,
     t0: Instant,
-    cpu0: u64,
     t1: Option<Instant>,
-    cpu1: u64,
     t2: Option<Instant>,
-    cpu2: u64,
-    core: i32,
-    freq: u32,
     t3: Option<Instant>,
     t4: Option<Instant>,
-    cpuflags: u32,
-    threads: i32,
-    asm: bool,
 }
 
 impl Trace {
     #[inline]
     fn new() -> Self {
-        let on = trace_enabled();
-        if on {
-            install_stage_hook();
-            STAGES.with(|c| c.set([None; 4]));
-        }
         Trace {
-            on,
+            on: trace_enabled(),
             t0: Instant::now(),
-            cpu0: if on { thread_cpu_us() } else { 0 },
             t1: None,
-            cpu1: 0,
             t2: None,
-            cpu2: 0,
-            core: -1,
-            freq: 0,
             t3: None,
             t4: None,
-            cpuflags: if on { dav1d_cpu_flags() } else { 0 },
-            threads: max_threads_runtime(),
-            asm: !noasm_enabled(),
         }
     }
 
@@ -259,7 +96,6 @@ impl Trace {
     fn mark1(&mut self) {
         if self.on {
             self.t1 = Some(Instant::now());
-            self.cpu1 = thread_cpu_us();
         }
     }
 
@@ -267,9 +103,6 @@ impl Trace {
     fn mark2(&mut self) {
         if self.on {
             self.t2 = Some(Instant::now());
-            self.cpu2 = thread_cpu_us();
-            self.core = current_core();
-            self.freq = core_freq_khz(self.core);
         }
     }
 
@@ -292,32 +125,14 @@ impl Trace {
             return;
         }
 
-        let us = |a: Instant, b: Instant| b.saturating_duration_since(a).as_micros() as i64;
+        let us = |a: Instant, b: Instant| b.saturating_duration_since(a).as_micros();
         let t1 = self.t1.unwrap_or(self.t0);
         let t2 = self.t2.unwrap_or(t1);
         let t3 = self.t3.unwrap_or(t2);
         let t4 = self.t4.unwrap_or(t3);
 
-        // E3：t2 内部拆成 open / send_data / get_picture 三段；解码器被复用时
-        // stage1 不会触发，对应字段输出 -1，这本身就是有用的信号。
-        let st = STAGES.with(|c| c.get());
-        let t2a = st[1].map(|x| us(t1, x)).unwrap_or(-1);
-        let t2b = match (st[1], st[2]) {
-            (Some(a), Some(b)) => us(a, b),
-            _ => -1,
-        };
-        let t2c = match (st[2], st[3]) {
-            (Some(a), Some(b)) => us(a, b),
-            _ => -1,
-        };
-
-        // E1：t2 段内本线程真正消耗的 CPU 时间；mark1 未触发（复用解码器）时退回 t0
-        let cpu_from = if self.cpu1 > 0 { self.cpu1 } else { self.cpu0 };
-        let cpu2 = self.cpu2.saturating_sub(cpu_from);
-
         let line = format!(
-            "[avif-trace] frame {}x{} t1={} t2={} t3={} t4={} t5=-1 total={} \
-             cpu2={} t2a={} t2b={} t2c={} cpu={} freq={} cpuflags=0x{:x} thr={} asm={}",
+            "[avif-trace] frame {}x{} t1={} t2={} t3={} t4={} t5=-1 total={}",
             width,
             height,
             us(self.t0, t1),
@@ -325,15 +140,6 @@ impl Trace {
             us(t2, t3),
             us(t3, t4),
             us(self.t0, t4),
-            cpu2,
-            t2a,
-            t2b,
-            t2c,
-            self.core,
-            self.freq,
-            self.cpuflags,
-            self.threads,
-            if self.asm { 1 } else { 0 },
         );
         log_line(&line);
     }
@@ -372,9 +178,6 @@ fn log_line(msg: &str) {
 /// 打开，默认构建保持上游的串行解码行为。
 #[cfg(feature = "max-threads")]
 const DECODE_MAX_THREADS: i32 = 4;
-// 未开 feature 时与上游一致：单线程。运行期仍可用 FLUTTER_AVIF_MAX_THREADS 覆盖。
-#[cfg(not(feature = "max-threads"))]
-const DECODE_MAX_THREADS: i32 = 1;
 
 lazy_static::lazy_static! {
     static ref DECODERS: RwLock<HashMap<String, DecoderRef>> = {
@@ -632,12 +435,10 @@ pub extern "C" fn encode_avif(port: i64, ptr: *const c_uchar, len: usize) -> i64
 fn _init_memory_decoder(ptr: *const u8, len: usize, trace: &mut Trace) -> *mut avifDecoder {
     unsafe {
         let decoder = libavif_sys::avifDecoderCreate();
-        // 改动 4（可选）：必须在 Parse 之前设置，libavif 会按此创建 dav1d 线程池。
-        // 默认 1（等于上游），可被 FLUTTER_AVIF_MAX_THREADS / debug.flutter_avif.threads 覆盖。
-        (*decoder).maxThreads = max_threads_runtime();
-        // E5 对照：强制 dav1d 走纯 C 路径（默认关闭）。必须在首次 dav1d_open 之前调用。
-        if noasm_enabled() {
-            dav1d_set_cpu_flags_mask(0);
+        // 改动 4（可选）：必须在 Parse 之前设置，libavif 会按此创建 dav1d 线程池
+        #[cfg(feature = "max-threads")]
+        {
+            (*decoder).maxThreads = DECODE_MAX_THREADS;
         }
 
         let set_memory_result = libavif_sys::avifDecoderSetIOMemory(decoder, ptr, len);
