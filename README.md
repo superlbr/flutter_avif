@@ -42,9 +42,10 @@ Paths are wired with `[patch.crates-io]` in `rust/Cargo.toml`; nothing is fetche
 - **dav1d 1.4.3** (the newest dav1d with vendored sources on crates.io).
 - **rav1e removed**, with `LTO`, `codegen-units = 1` and `--strip-unneeded` enabled; decoding-only
   binaries do not need an encoder.
-- **Optional `max-threads` feature**, off by default. AVIF frames are usually a single tile, and a
-  single tile gives no measurable parallel speedup while costing extra YUV buffers, so threading
-  is opt-in rather than baked in.
+- **Decoder threading on by default (2 threads)**, tunable to 4 with the `max-threads` feature.
+  Device-measured −21% on frame total and −19% on p95 for single-tile pages; the mechanism, and the
+  earlier "no benefit" claim this measurement overturns, are documented under
+  [Benchmark](#benchmark).
 
 ## Size
 
@@ -52,8 +53,8 @@ Both ABIs, same toolchain, same flags:
 
 | ABI | Previous build (raw) | This build (raw) | **This build (stripped)** | Previous (stripped) | Delta (stripped) |
 |---|---|---|---|---|---|
-| arm64-v8a | 4,362,296 | 1,921,936 | **1,526,112** | 3,309,496 | −1,783,384 (−53.9%) |
-| armeabi-v7a | 3,061,960 | 1,616,472 | **1,245,132** | 2,405,044 | −1,159,912 (−48.2%) |
+| arm64-v8a | 4,362,296 | 1,922,056 | **1,526,112** | 3,309,496 | −1,783,384 (−53.9%) |
+| armeabi-v7a | 3,061,960 | 1,617,176 | **1,245,644** | 2,405,044 | −1,159,400 (−48.2%) |
 
 The libyuv fast path is what makes this build *larger* than a libyuv-less one: +156,288 B
 (+11.4%) on arm64-v8a and +102,176 B (+8.9%) on armeabi-v7a, stripped. That cost buys the
@@ -91,9 +92,79 @@ Caveats, stated plainly:
   47.7 ms end-to-end minus 22.5 ms of scalar reformat plus ~0.9 ms of libyuv reformat. It has not
   been measured on a device.
 
-Because reformat drops to sub-millisecond, row-stripe parallelism was evaluated and rejected:
-thread wake-up plus barrier costs 0.1–0.3 ms by itself, and N in-flight stripe buffers raise peak
-memory. `max-threads` therefore stays off by default.
+Because reformat drops to sub-millisecond, row-stripe parallelism inside the converter was
+evaluated and rejected: thread wake-up plus barrier costs 0.1–0.3 ms by itself, and N in-flight
+stripe buffers raise peak memory. That finding is about splitting *reformat*; it says nothing
+about dav1d's own threading, which is a different question — see below.
+
+### Decoder threading — 2 threads by default
+
+**A claim in earlier revisions was wrong.** This document used to say "a single tile gives no
+measurable parallel speedup, so threading stays opt-in". On-device measurement contradicts that,
+and the claim is withdrawn. The old reasoning considered only frame-level and tile-level
+parallelism; it missed the sbrow-level pipeline.
+
+Provenance for every number in this section:
+
+| Field | Value |
+|---|---|
+| Device | Honor PTP-AN00 |
+| Page | full page, 896×1200, single tile (1×1), 8-bit 4:2:0 |
+| Sample | same work, same batch of pages for all arms |
+| Rounds | 2 per arm in the A/B; thread sweep is a single-pass scan |
+| Statistic | `total` = sum of the per-stage deltas, `t2` = `avifDecoderNextImage` |
+
+Thread sweep, free-running (per-frame medians; `t2` is where the change lands):
+
+| `thr` | t2 p50 | frame total | thread CPU inside t2 | n |
+|---|---|---|---|---|
+| 1 (baseline) | 19.6 ms | 24.4 ms | 19.4 ms | 24 |
+| 2 | **13.7 ms** (−27%, 1.37×) | 18.5 ms | 0.24 ms | 10 |
+| 4 | 13.2 ms | 19.1 ms | 0.39 ms | 10 |
+
+A/B acceptance run, 2 rounds per arm:
+
+| Metric | `thr=1` | `thr=2` | Delta |
+|---|---|---|---|
+| `total` p50 | 20.06 ms | **15.76 ms** | **−21.4%** |
+| `total` p95 | 27.49 ms | **22.24 ms** | **−19.1%** (less tail) |
+| frames over 33 ms | 0 / 0 | 0 / 0 | none, both rounds |
+| frames over 16 ms | 3 | 3–4 | unchanged |
+| PSS peak | baseline | +3.5 MB (+1.0%) | under the 5 MB budget |
+| PSS steady state | baseline | −0.4 MB | slightly lower |
+| Temperature | baseline | +1 °C | — |
+
+Neither frame-level nor tile-level parallelism explains the gain:
+
+- **Frame level is already off the table.** `codec_dav1d.c` sets `dav1dSettings.max_frame_delay = 1`
+  (the `DAV1D_API_VERSION_MAJOR >= 6` branch), so dav1d's `get_num_threads()` yields `n_fc = 1` and
+  no two frames are ever decoded concurrently.
+- **Tile level has nothing to split.** These pages are 1×1 tiling, so a tile-thread pool would have
+  exactly one work item.
+- **What overlaps is reconstruction with post-filtering, per sbrow.** With `n_tc > 1`, dav1d does
+  not run `dav1d_decode_frame_main()` inline; it submits per-sbrow reconstruction tasks plus
+  `FILTER_SBROW` tasks, and the loop-filter / CDEF / LR chain of sbrow *n* consumes the finished
+  reconstruction of sbrow *n* while sbrow *n+1* is reconstructed. One frame therefore has exactly
+  two runnable chains — reconstruction and filtering — which is why `thr = 2` captures the whole
+  gain and `thr = 4` adds nothing while slightly worsening the frame total (19.1 ms vs 18.5 ms).
+- The collapse of `cpu2` from 19.4 ms to 0.24 ms is the same fact seen from the caller: with
+  `n_tc > 1` the calling thread only submits tasks and blocks in `pthread_cond_wait`.
+
+What this does and does not fix:
+
+- **Scrubbing is unaffected.** Dragging the progress bar measured the same with and without
+  threading; the 1.5-frame difference between arms is inside run-to-run noise. That path does not
+  wait on decoding, so it should not be expected to improve.
+- **The gain is headroom, not a stutter fix.** With `thr = 1` the over-33 ms count was already
+  zero, so nothing that was visibly broken got fixed. What changes is roughly **4–5 ms of CPU
+  saved per page and the first frame arriving 4–5 ms sooner** — margin for heavier pages and for
+  slower devices, not a cure for an observed freeze.
+- **One unexplained memory observation, not ruled out.** In one round `thr = 2` showed a PSS spike
+  around 360 MB; in the other round it sat below `thr = 1`. It did not reproduce, and it is treated
+  as jitter — but it is *not* explained, and this note is the record of that.
+
+Default is 2 threads, clamped to the number of available cores (never below 1). `--features
+max-threads` builds with 4 for comparison.
 
 ## Pixel difference
 
@@ -116,7 +187,7 @@ rounding artifact and is not visible.
 ```bash
 ./build.sh                  # both ABIs
 ./build.sh arm64-v8a        # one ABI
-./build.sh --features max-threads   # opt-in decoder threading
+./build.sh --features max-threads   # 4 decoder threads (default is 2)
 ```
 
 Output is written to `dist/<abi>/libflutter_avif.so` and mirrored into

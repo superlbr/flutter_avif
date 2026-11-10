@@ -13,18 +13,33 @@ use crate::models::encode_request::EncodeRequest;
 use crate::models::frame::Frame;
 use crate::models::key_request::KeyRequest;
 
-/// 改动 4：dav1d 的解码线程数，**默认关闭的可选开关**。
+/// dav1d 的解码线程数（`avifDecoder.maxThreads`）。上游只给 encoder 设了 `maxThreads`，
+/// decoder 用的是 libavif 默认值 1。
 ///
-/// 上游只给 encoder 设了 `maxThreads`，decoder 用的是 libavif 默认值 1。实测结论：
-///   * 多 tile 图（avifenc 默认 autotiling 出的 2x4）4 线程约 3.1~3.5x；
-///   * 单 tile 图（当前线上形态，1x1）只有 1.02x，等于没有收益，还会多出几个
-///     约 3.8MB 的 YUV 槽位，内存峰值反而变差。
+/// 真机结论（Honor PTP-AN00，整页 896×1200 单 tile，同一作品同一批页，每臂 2 轮）：
+///   * `total` p50 20.06ms → 15.76ms（−21.4%），p95 27.49ms → 22.24ms（−19.1%）；
+///   * PSS 峰值 +3.5MB（+1.0%），稳态 −0.4MB；`over33` 两轮均为 0，`over16` 3 vs 3~4。
+///   * 收益不是帧级并行也不是 tile 并行：libavif 已设 `max_frame_delay = 1`（`n_fc = 1`），
+///     页面 tiling 也是 1x1。真正重叠的是 sbrow 级「重建 ↔ loopfilter/cdef」任务链，
+///     单帧只有两条链，所以 2 线程即饱和、4 线程无额外收益。
 ///
-/// 所以这里不硬编码，做成 cargo feature：需要时用
-///   `./build.sh --features max-threads`
-/// 打开，默认构建保持上游的串行解码行为。
+/// 故默认 2 线程，按可用核数裁剪（最少 1）；`--features max-threads` 可改成 4 做对照。
 #[cfg(feature = "max-threads")]
 const DECODE_MAX_THREADS: i32 = 4;
+#[cfg(not(feature = "max-threads"))]
+const DECODE_MAX_THREADS: i32 = 2;
+
+/// 可用核数；读不到就按 1 算（宁可少开线程，不要过订）。
+fn available_cores() -> i32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(1)
+}
+
+/// 实际下发给 dav1d 的线程数。
+fn decoder_threads() -> i32 {
+    DECODE_MAX_THREADS.min(available_cores()).max(1)
+}
 
 lazy_static::lazy_static! {
     static ref DECODERS: RwLock<HashMap<String, DecoderRef>> = {
@@ -268,11 +283,8 @@ pub extern "C" fn encode_avif(port: i64, ptr: *const c_uchar, len: usize) -> i64
 fn _init_memory_decoder(ptr: *const u8, len: usize) -> *mut avifDecoder {
     unsafe {
         let decoder = libavif_sys::avifDecoderCreate();
-        // 改动 4（可选）：必须在 Parse 之前设置，libavif 会按此创建 dav1d 线程池
-        #[cfg(feature = "max-threads")]
-        {
-            (*decoder).maxThreads = DECODE_MAX_THREADS;
-        }
+        // 必须在 Parse 之前设置：libavif 会在第一次 NextImage 里按此创建 dav1d 线程池
+        (*decoder).maxThreads = decoder_threads();
 
         let set_memory_result = libavif_sys::avifDecoderSetIOMemory(decoder, ptr, len);
         if set_memory_result != libavif_sys::AVIF_RESULT_OK {
