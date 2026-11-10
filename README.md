@@ -201,6 +201,15 @@ Output is written to `dist/<abi>/libflutter_avif.so` and mirrored into
 | ninja | any recent | meson backend |
 | Android NDK | 28.2.13676358 (r28c) | located via `ANDROID_NDK_HOME` or the SDK directory |
 
+`meson` and `ninja` must be on `PATH`. A `pip3 install --user` on macOS puts them under
+`~/Library/Python/<python-version>/bin`, which is not on `PATH` by default, and the build stops
+with a "meson not found" message before compiling anything:
+
+```bash
+pip3 install --user meson ninja
+export PATH="$HOME/Library/Python/3.9/bin:$PATH"   # adjust the version if yours differs
+```
+
 `build.sh` finishes with an `llvm-nm -D -u` check and fails the build if any `dav1d_*` / `avif*`
 symbol is left undefined.
 
