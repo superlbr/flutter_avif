@@ -16,9 +16,11 @@ fn main() {
     let avif = env::var("DEP_AVIF_STATICLIB")
         .expect("DEP_AVIF_STATICLIB 缺失：确认 vendors/libavif-sys 的 Cargo.toml 有 links = \"avif\"");
     let dav1d = env::var("DEP_DAV1D_STATICLIB")
-        .expect("DEP_DAV1D_STATICLIB 缺失：确认 libdav1d-sys 在 build-dependencies 里");
+        .expect("DEP_DAV1D_STATICLIB 缺失：确认 libdav1d-sys 是普通依赖（带 links = \"dav1d\"）");
+    let yuv = env::var("DEP_AVIF_YUV_STATICLIB")
+        .expect("DEP_AVIF_YUV_STATICLIB 缺失：确认 vendors/libavif-sys 发出了 cargo:yuv_staticlib");
 
-    for p in [&avif, &dav1d] {
+    for p in [&avif, &dav1d, &yuv] {
         if !std::path::Path::new(p).exists() {
             panic!("静态库不存在: {p}（build script 可能被缓存跳过，试 cargo clean）");
         }
@@ -27,6 +29,7 @@ fn main() {
     println!("cargo:rustc-link-arg=-Wl,--start-group");
     println!("cargo:rustc-link-arg={avif}");
     println!("cargo:rustc-link-arg={dav1d}");
+    println!("cargo:rustc-link-arg={yuv}");
     println!("cargo:rustc-link-arg=-Wl,--end-group");
     // libavif 用到 libm，Android 上不会自动带上
     println!("cargo:rustc-link-arg=-lm");

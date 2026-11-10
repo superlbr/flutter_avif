@@ -56,6 +56,36 @@ fn main() {
         }
     }
 
+    eprintln!("building libyuv");
+    // 本地 vendor 时新增（改动 5）：上游默认 -DCMAKE_DISABLE_FIND_PACKAGE_libyuv=1，
+    // 于是 avifImageYUVToRGB 只能跑 reformat.c 里的标量 C 实现。这里先把仓库内
+    // vendors/libyuv（版本 1974）编成静态库，再把路径直接灌进 libavif 的 cache 变量，
+    // 让它走 src/reformat_libyuv.c 的 SIMD 快路径。
+    let libyuv_src = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("../libyuv");
+    let mut yuv = Config::new(&libyuv_src);
+    yuv.define("BUILD_SHARED_LIBS", "0")
+        .define("LIBYUV_DISABLE_JPEG", "ON") // 只要 YUV/RGB 转换，不引 libjpeg
+        .define("UNIT_TEST", "OFF")
+        .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON") // 静态库要进 .so，必须 PIC
+        .profile(if env::var("PROFILE").expect("PROFILE") == "release" {
+            "Release"
+        } else {
+            "Debug"
+        });
+    let yuv_built = yuv.build();
+    let yuv_include = yuv_built.join("include");
+    let yuv_staticlib = yuv_built.join("lib").join("libyuv.a");
+    assert!(
+        yuv_staticlib.exists(),
+        "libyuv 没编出来：{}",
+        yuv_staticlib.display()
+    );
+
+    avif.define("LIBYUV_INCLUDE_DIR", &yuv_include);
+    avif.define("LIBYUV_LIBRARY", &yuv_staticlib);
+    // 显式覆盖成 0：老构建目录的 CMakeCache 里还留着 =1
+    avif.define("CMAKE_DISABLE_FIND_PACKAGE_libyuv", "0");
+
     eprintln!("building libavif");
 
     let local_pc_files = env::join_paths(pc_paths).unwrap();
@@ -69,8 +99,7 @@ fn main() {
     } else {
         "Debug"
     })
-    .configure_arg("-DCMAKE_INSTALL_LIBDIR=lib")
-    .configure_arg("-DCMAKE_DISABLE_FIND_PACKAGE_libyuv=1");
+    .configure_arg("-DCMAKE_INSTALL_LIBDIR=lib");
     if env::var("LIBAVIF_CROSS_WIN32").is_ok() {
         avif.configure_arg("-T host=x64").configure_arg("-A Win32");
     }
@@ -87,6 +116,8 @@ fn main() {
         "cargo:staticlib={}",
         avif_built.join("lib").join("libavif.a").display()
     );
+    // libavif.a 里 reformat_libyuv.c 引用了 yuv 的符号，最终 .so 的链接组里也要带上它
+    println!("cargo:yuv_staticlib={}", yuv_staticlib.display());
 
     println!("cargo:outdir={}", out_dir.display());
 }

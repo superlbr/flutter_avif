@@ -4,6 +4,9 @@ rust/target/
 # build.sh 的输出目录（同一份 .so 已经同步进 flutter_avif_android/.../jniLibs/）
 dist/
 
+# bench 的宿主构建目录
+bench/.build/
+
 # Flutter / IDE
 .dart_tool/
 .packages
