@@ -14,6 +14,9 @@ default = []
 # 改动 4 的可选开关：给 decoder 设 4 个 dav1d 线程。
 # 单 tile（当前线上形态）实测无收益，多 tile 才有 3.1~3.5x，所以默认不开。
 max-threads = []
+# 改动 6 的兜底通道：编出的 .so 无条件打分段计时日志。
+# 仅在 debug.flutter_avif.trace 与 FLUTTER_AVIF_TRACE 都设不了的设备上使用。
+trace-always = []
 
 [dependencies]
 libavif-sys = { version = "0.17", default-features = false, features = ["codec-dav1d"] }

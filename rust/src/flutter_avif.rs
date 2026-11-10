@@ -14,14 +14,17 @@ use crate::models::encode_request::EncodeRequest;
 use crate::models::frame::Frame;
 use crate::models::key_request::KeyRequest;
 
-/// 分段计时开关：进程环境变量 `FLUTTER_AVIF_TRACE` 存在即开启，默认完全关闭。
+/// 分段计时开关，三个通道取或，进程内只求值一次（首帧时 cache 进 OnceLock）：
 ///
-/// Android 上给 app 注入环境变量：
-/// ```text
-/// adb shell setprop wrap.<applicationId> "env FLUTTER_AVIF_TRACE=1"
-/// ```
-/// （需要 debuggable 包；改完要 `adb shell setprop wrap.<applicationId> ""` 复位）
-/// 宿主调试直接 `FLUTTER_AVIF_TRACE=1 ./your_binary`。
+/// 1. 编译期 `--features trace-always`：无条件开启，用于属性/环境变量都设不了的设备；
+/// 2. 环境变量 `FLUTTER_AVIF_TRACE` 存在即开启（值不看，存在就算）——
+///    桌面直接 `FLUTTER_AVIF_TRACE=1 ./x`；Android 需 root 或 debuggable 包 + `wrap.*`；
+/// 3. Android 系统属性 `debug.flutter_avif.trace = 1`（也接受 `true`）：
+///    `adb shell setprop debug.flutter_avif.trace 1`。
+///
+/// 注意：窗口只有「进程启动后第一次解码」这一瞬间。属性是那时读一次并缓存的，
+/// 之后再 `setprop`/`setprop ... ""` 都不会改变本进程行为——改完必须重启 App，
+/// 关掉同样要再重启一次。
 ///
 /// 输出固定一行，单位微秒，字段顺序固定，便于脚本解析：
 /// ```text
@@ -30,10 +33,41 @@ use crate::models::key_request::KeyRequest;
 /// t1 = create+Parse（header）、t2 = NextImage（dav1d 出 YUV）、t3 = YUVToRGB、
 /// t4 = write_to_bytes 组包完成，四个值都是**相对上一段的耗时**；`total` = t0→t4。
 /// `t5` 恒为 -1：postCObject 发生在 `allo_isolate::Isolate::task` 内部，从这里量不到，
-/// 需要 Dart 侧用「回调到达时间 − t4」补（见 README/交付说明）。
+/// 需要 Dart 侧用「回调到达时间 − t4」补。
 fn trace_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLUTTER_AVIF_TRACE").is_some())
+    *ON.get_or_init(|| {
+        if cfg!(feature = "trace-always") {
+            return true;
+        }
+        if std::env::var_os("FLUTTER_AVIF_TRACE").is_some() {
+            return true;
+        }
+        #[cfg(target_os = "android")]
+        {
+            return property_is(b"debug.flutter_avif.trace\0", b"1");
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            false
+        }
+    })
+}
+
+/// 读 Android 系统属性，与 `expected` 相等（大小写不敏感）即为真。
+/// `__system_property_get` 返回值的字节数，未设置时返回 0——空值一律当关闭。
+#[cfg(target_os = "android")]
+fn property_is(name: &[u8], expected: &[u8]) -> bool {
+    extern "C" {
+        fn __system_property_get(name: *const c_uchar, value: *mut c_uchar) -> i32;
+    }
+    // PROP_VALUE_MAX = 92，含结尾 NUL
+    let mut buf = [0u8; 92];
+    let len = unsafe { __system_property_get(name.as_ptr(), buf.as_mut_ptr()) };
+    if len <= 0 || len as usize >= buf.len() {
+        return false;
+    }
+    buf[..len as usize].eq_ignore_ascii_case(expected)
 }
 
 struct Trace {
