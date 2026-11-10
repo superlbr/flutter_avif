@@ -8,7 +8,6 @@ on:
   workflow_dispatch:
 
 env:
-  NDK_VERSION: 28.2.13676358
   CARGO_NDK_VERSION: 4.1.2
 
 jobs:
@@ -44,14 +43,21 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           meson --version
 
+      # 只需要 NDK，不需要整套 Android SDK。
+      # 用 android-actions/setup-android 时这一步会挂（它要接管 runner 上已有的 SDK），
+      # 换成 nttld/setup-ndk：只下载并解压指定版本 NDK，再给出 ndk-path。
       # NDK r28c = 28.2.13676358；r28 起默认 16KB 页对齐
-      - name: Setup Android SDK + NDK
-        uses: android-actions/setup-android@v3
+      - name: Setup NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28c
+          add-to-path: false
 
-      - name: Install NDK
+      - name: Export ANDROID_NDK_HOME
         run: |
-          sdkmanager --install "ndk;$NDK_VERSION"
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${{ steps.ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+          echo "NDK = ${{ steps.ndk.outputs.ndk-path }}"
 
       - name: Cache cargo
         uses: actions/cache@v4
